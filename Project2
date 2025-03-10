@@ -1,0 +1,185 @@
+// 📌 Program to read sensor data and send it to NETPIE MQTT using ESP32
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HTS221.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_SHT4x.h>
+#include <Adafruit_MPU6050.h>
+#include <time.h>
+#include <NTPClient.h>
+#include <freertos/queue.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <stdlib.h>
+
+// 📌 Define Wi-Fi SSID and password
+#define WIFI_SSID "KorDor"
+#define WIFI_PASSWORD "12345678"
+
+// 📌 Define MQTT connection settings for NETPIE
+const int mqtt_port = 1883;
+const char* mqtt_server = "broker.netpie.io";
+const char* mqtt_username = "6TGc4TiiYrinXArAWKGUe6fyA3DKtS1X";
+const char* mqtt_password = "RFWeAiDFHNbbr6BifiDSMJLZBhJgUkK6";
+const char* mqtt_clientID = "32b43b03-bc1e-4289-a04b-1f6f4cafd08a";
+
+// 📌 Create objects for sensors
+Adafruit_HTS221 hts;
+Adafruit_SHT4x sht4;
+Adafruit_BMP280 bmp;
+Adafruit_MPU6050 mpu;
+
+// 📌 Create objects for Wi-Fi and MQTT
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// 📌 Create a queue to store sensor data
+struct SensorData {
+    float temperature;
+    float humidity;
+    float pressure;
+    float accelX, accelY, accelZ;
+    float gyroX, gyroY, gyroZ;
+};
+QueueHandle_t sensorDataQueue;
+
+// ✅ Function to connect to Wi-Fi
+void connectToWiFi() {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 10) {
+        delay(2000);
+        Serial.print(".");
+        retry++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n✅ Connected to WiFi.");
+    } else {
+        Serial.println("\n❌ WiFi Connection Failed! Restarting ESP32...");
+        ESP.restart();
+    }
+}
+
+// ✅ Function to connect to NETPIE MQTT
+void connectToNETPIE() {
+    client.setServer(mqtt_server, mqtt_port);
+    int retry = 0;
+    while (!client.connected() && retry < 5) {
+        Serial.print("Attempting MQTT connection...");
+        if (client.connect(mqtt_clientID, mqtt_username, mqtt_password)) {
+            Serial.println("✅ Connected to NETPIE MQTT.");
+        } else {
+            Serial.print("❌ Failed, rc=");
+            Serial.print(client.state());
+            Serial.println(" Retrying in 5 seconds...");
+            retry++;
+            delay(5000);
+        }
+    }
+    if (!client.connected()) {
+        Serial.println("🚨 MQTT Connection Failed! Restarting ESP32...");
+        ESP.restart();
+    }
+}
+
+// ✅ Task: Read sensor data and store it in the queue every 10 seconds
+void getData(void *pvParameters) {
+    SensorData data;
+    for (;;) {
+        sensors_event_t HTS221_humidity, HTS221_temp, bmp_temp, bmp_pressure;
+        sensors_event_t accel, gyro;
+        bool sensorFound = false;
+
+        // 📌 Read data from HTS221 or SHT4x
+        if (hts.begin_I2C()) {
+            hts.getEvent(&HTS221_humidity, &HTS221_temp);
+            data.temperature = HTS221_temp.temperature;
+            data.humidity = HTS221_humidity.relative_humidity;
+            sensorFound = true;
+        } else if (sht4.begin()) {
+            sensors_event_t sht_humid, sht_temp;
+            sht4.getEvent(&sht_humid, &sht_temp);
+            data.temperature = sht_temp.temperature;
+            data.humidity = sht_humid.relative_humidity;
+            sensorFound = true;
+        }
+
+        // 📌 Read air pressure data from BMP280
+        if (bmp.begin(0x76)) {
+            bmp.getTemperatureSensor()->getEvent(&bmp_temp);
+            bmp.getPressureSensor()->getEvent(&bmp_pressure);
+            data.pressure = bmp_pressure.pressure;
+            sensorFound = true;
+        }
+
+        // 📌 Read acceleration and gyroscope data from MPU6050
+        if (mpu.begin()) {
+            mpu.getEvent(&accel, &gyro, &bmp_temp);
+            data.accelX = accel.acceleration.x;
+            data.accelY = accel.acceleration.y;
+            data.accelZ = accel.acceleration.z;
+            data.gyroX = gyro.gyro.x;
+            data.gyroY = gyro.gyro.y;
+            data.gyroZ = gyro.gyro.z;
+            sensorFound = true;
+        }
+
+        // 📌 Send data to the queue
+        if (sensorFound) {
+            xQueueSend(sensorDataQueue, &data, (TickType_t)10);
+            Serial.println("📦 Sensor Data Queued");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
+// ✅ Task: Send data to NETPIE MQTT every 10 seconds
+void PublishData(void *pvParameters) {
+    SensorData data;
+    for (;;) {
+        if (xQueueReceive(sensorDataQueue, &data, portMAX_DELAY)) {
+            if (!client.connected()) {
+                connectToNETPIE();
+            }
+
+            // 📌 Create JSON to send to Shadow
+            String jsonData = "{\"data\": {"
+                              "\"temperature\": " + String(data.temperature, 2) + 
+                              ", \"humidity\": " + String(data.humidity, 2) + 
+                              ", \"pressure\": " + String(data.pressure, 2) + 
+                              ", \"accelX\": " + String(data.accelX, 2) + 
+                              ", \"accelY\": " + String(data.accelY, 2) + "}}";
+
+            // 📌 Send data to NETPIE
+            if (client.publish("@shadow/data/update", jsonData.c_str(), true)) {
+                Serial.println("✅ Data sent to NETPIE Shadow: " + jsonData);
+            } else {
+                Serial.println("❌ Failed to send data to NETPIE Shadow!");
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(41, 40);
+
+    connectToWiFi();
+    connectToNETPIE();
+
+    sensorDataQueue = xQueueCreate(10, sizeof(SensorData));
+
+    xTaskCreate(getData, "SensorTask", 10000, NULL, 1, NULL);
+    xTaskCreate(PublishData, "MqttTask", 10000, NULL, 1, NULL);
+}
+
+void loop() {
+    client.loop();
+}
